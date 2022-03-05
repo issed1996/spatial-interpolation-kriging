@@ -1,0 +1,197 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(tidyverse) 
+library(sf) 
+library(sp) 
+library(raster) 
+
+# Packages for geostatistics
+library(gstat)   
+library(automap) 
+
+# Finally, some packages to make pretty plots
+library(patchwork)
+library(viridis)
+
+# see http://www.govdata.de/dl-de/by-2-0 for more details
+
+grd_100_df <- readr::read_csv(
+  "https://raw.githubusercontent.com/Ignimbrit/exchange/master/data/2020/grid_100.csv",
+  ) %>% 
+  dplyr::select(-licence)
+
+# The projection is EPSG 25832
+
+head(grd_100_df)
+```
+```{r}
+grd_100_rstr <- raster::rasterFromXYZ(
+  grd_100_df, 
+  res = c(100, 100), # resolution in meter (see crs)
+  crs = "+proj=utm +zone=32 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+    )
+
+plot(grd_100_rstr)
+```
+```{r}
+set.seed(40000) # for reproducibility
+
+# Simulate 100 random observation wells 
+wellobs <- slice_sample(grd_100_df, n = 100)
+
+ggplot(
+  data = wellobs,
+  mapping = aes(x = X, y = Y, color = Z)
+) +
+  geom_point(size = 3) + 
+  scale_color_viridis(option = "B") +
+  theme_classic()
+```
+```{r}
+# Convert to {sf} because that is the best way to store spatial points
+wellobs_sf <- st_as_sf(wellobs, coords = c("X", "Y"), crs = 25832) %>% 
+  cbind(st_coordinates(.))
+```
+```{r}
+# We will discuss later, what Z~1 does actually mean in this context
+v_emp_OK <- gstat::variogram(
+  Z~1,
+  as(wellobs_sf, "Spatial") # switch from {sf} to {sp}
+  )
+
+plot(v_emp_OK)
+```
+```{r}
+# automap's autofitVariogram actually produces more info than we need.
+# I will only keep the var_model part.
+v_mod_OK <- automap::autofitVariogram(Z~1, as(wellobs_sf, "Spatial"))$var_model
+
+# To inspect the automatic fit that was chosen for us we can use
+# automap's excellent build in methods for base::plot
+plot(automap::autofitVariogram(Z~1, as(wellobs_sf, "Spatial")))
+```
+```{r}
+
+
+# Step 1: define a grid based on the bounding box of our observations
+grd_100_sf <- wellobs_sf %>% 
+  st_bbox() %>% 
+  st_as_sfc() %>% 
+  st_make_grid(
+  cellsize = c(100, 100), # 100m pixel size
+  what = "centers"
+  ) %>%
+  st_as_sf() %>%
+  cbind(., st_coordinates(.))
+
+# Step 2: making our grid work for gstat
+grd_100_sp <- as(grd_100_sf, "Spatial") # converting to {sp} format
+gridded(grd_100_sp) <- TRUE             # informing the object that it is a grid
+grd_100_sp <- as(grd_100_sp, "SpatialPixels") # specifying what kind of grid
+
+```
+```{r}
+# Ordinary Kriging
+OK <- krige(
+  Z~1,                       # Z is our variable and "~1" means "depends on mean"
+  as(wellobs_sf, "Spatial"), # input data in {sp} format
+  grd_100_sp,                # locations to interpolate at
+  model = v_mod_OK           # the variogram model fitted above
+  )
+```
+```{r}
+# Simple Kriging
+SK <- krige(
+  Z~1,                       # Z still depends on mean
+  beta = mean(grd_100_df$Z), # but this time we know the mean's value
+  as(wellobs_sf, "Spatial"), # input data in {sp} format
+  grd_100_sp,                # locations to interpolate at
+  model = v_mod_OK           # the variogram model fitted above
+  )
+```
+```{r}
+# Universal Kriging
+# Implementing this method is somewhat different.
+# we no longer assume that Z is essentially depending on a single mean but
+# rather on the position of the interpolation location within our target grid
+UK <- krige(
+  Z~coords.x1+coords.x2, # Think "Z~X+Y" but {sp} conversion alters variable naming
+  as(wellobs_sf, "Spatial"), # input data in {sp} format (`X` --> `coords.x1`)
+  grd_100_sp,                # locations to interpolate at
+  model = autofitVariogram(  # we need an appropriate variogram fit
+    Z~X+Y,                   # here we can keep "X+Y" - it's just how it is
+    as(wellobs_sf, "Spatial")
+    )$var_model
+  )
+```
+```{r}
+# I'll also add an inverse distance weighted model to provide a baseline
+# for model evaluation
+# Note how the only difference to Ordinary Kriging is the absence of a
+# fitted variogram model
+idwres <- idw(
+  Z~1,                       # idw also depends on mean
+  as(wellobs_sf, "Spatial"), # input data in {sp} format
+  grd_100_sp,                # locations to interpolate at
+) 
+```
+```{r}
+# A function to plot rasters
+plot_my_gstat_output <- function(raster_object, object_name){
+  
+  df <- rasterToPoints(raster_object) %>% as_tibble()
+  colnames(df) <- c("X", "Y", "Z")
+  
+  ggplot(df, aes(x = X, y = Y, fill = Z)) +
+    geom_raster() +
+    ggtitle(label = object_name) +
+    scale_fill_viridis(option = "B", limits = c(50, 100)) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5)
+    )
+}
+
+p_orig <- plot_my_gstat_output(grd_100_rstr, "Original Raster")
+p_idw <- plot_my_gstat_output(raster(idwres), "IDW")
+p_SK <- plot_my_gstat_output(raster(SK), "Simple Kriging")
+p_OK <- plot_my_gstat_output(raster(OK), "Ordinary Kriging")
+p_UK <- plot_my_gstat_output(raster(UK), "Universal Kriging")
+
+
+p_wellobs <- ggplot(
+  data = wellobs,
+  mapping = aes(x = X, y = Y, color = Z)
+) +
+  geom_point(size = 3) + 
+  scale_color_viridis(option = "B",  limits = c(50, 100)) +
+  ggtitle(label = "Observation Wells Sampled") +
+  theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5)
+    )
+
+(p_orig + p_wellobs + p_idw) / 
+  (p_SK + p_OK + p_UK) + 
+  plot_layout(guides = 'collect')
+```
+```{r}
+UK
+``
+```{r}
+plot(cars)
+```
+```{r}
+plot(cars)
+```
+```{r}
+plot(cars)
+```
